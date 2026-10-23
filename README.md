@@ -134,7 +134,14 @@ python3 -m unittest            # runs against an in-process fake TV and a fake l
 python3 -m lgtv_companion -v status
 ```
 
-## Credits
+## Credits and license
 
-Behaviour and protocol details come from [LGTV Companion](https://github.com/JPersson77/LGTVCompanion)
-by Jörgen Persson (MIT License).
+This is a port of [LGTV Companion](https://github.com/JPersson77/LGTVCompanion) by Jörgen
+Persson, which is MIT licensed. The behaviour and protocol details come from it: the registration
+manifest, the request URIs, checking the power state before turning a TV off, and calling luna://
+services through a notification alert. The code is a new implementation in Python.
+
+Released under the MIT License. [LICENSE](LICENSE) includes upstream's copyright notice.
+
+This is an independent project. It is not affiliated with or endorsed by Jörgen Persson or LG
+Electronics.
