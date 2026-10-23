@@ -18,9 +18,10 @@ class ConfigTest(unittest.TestCase):
         config = Config.load(self.path)
         self.assertEqual(config.devices, [])
         self.assertEqual(config.power_on_timeout, 40)
+        self.assertEqual(config.display_off_delay, 10)
 
     def test_round_trip_and_private_permissions(self):
-        config = Config(path=self.path, power_on_timeout=25, devices=[
+        config = Config(path=self.path, power_on_timeout=25, display_off_delay=0, devices=[
             Device(name="Living room", ip="192.168.0.50", macs=["aa:bb:cc:dd:ee:ff"],
                    client_key="secret", hdmi_input=2, check_input_before_power_off=True)])
         config.save()

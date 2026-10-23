@@ -10,6 +10,9 @@ from gi.repository import Gio, GLib
 
 from lgtv_companion import webos
 from lgtv_companion.daemon import LOGIND, LOGIND_IFACE, LOGIND_PATH, Daemon
+from lgtv_companion.display import (DBUS, DBUS_PATH, MUTTER, MUTTER_IFACE, MUTTER_PATH,
+                                    PROPERTIES_IFACE)
+from lgtv_companion.tv import URI_FOREGROUND_APP
 
 from .fake_tv import FakeTV
 from .test_tv import closed_port
@@ -61,6 +64,48 @@ class FakeBus:
                               GLib.Variant(signature, args))
 
 
+class FakeSessionBus:
+    """Stands in for the user's session bus, with GNOME's Mutter on it (unless `mutter=False`)."""
+
+    def __init__(self, power_save_mode=0, mutter=True):
+        self.mode = power_save_mode
+        self.mutter = mutter
+        self.handlers = {}
+        self.on_closed = None
+
+    def set_exit_on_close(self, value):
+        assert value is False
+
+    def connect(self, signal_name, handler):
+        assert signal_name == "closed"
+        self.on_closed = handler
+
+    def signal_subscribe(self, sender, iface, member, path, arg0, flags, callback):
+        self.handlers[member] = callback
+
+    def call_sync(self, name, path, iface, method, params, *rest):
+        assert (name, method, params.unpack()) == (MUTTER, "Get", (MUTTER_IFACE, "PowerSaveMode"))
+        if not self.mutter:
+            raise GLib.Error(f'Name "{MUTTER}" does not exist')
+        return GLib.Variant("(v)", (GLib.Variant("i", self.mode),))
+
+    def set_mode(self, mode):
+        self.mode = mode
+        changed = {"PowerSaveMode": GLib.Variant("i", mode)}
+        self.handlers["PropertiesChanged"](self, ":1.10", MUTTER_PATH, PROPERTIES_IFACE,
+                                           "PropertiesChanged",
+                                           GLib.Variant("(sa{sv}as)", (MUTTER_IFACE, changed, [])))
+
+    def set_mutter_running(self, running):
+        self.mutter = running
+        owners = ("", ":1.10") if running else (":1.10", "")
+        self.handlers["NameOwnerChanged"](self, DBUS, DBUS_PATH, DBUS, "NameOwnerChanged",
+                                          GLib.Variant("(sss)", (MUTTER, *owners)))
+
+    def close(self):
+        self.on_closed(self, True, None)
+
+
 def wait_for(condition, timeout=10):
     context = GLib.MainContext.default()
     deadline = time.monotonic() + timeout
@@ -69,6 +114,12 @@ def wait_for(condition, timeout=10):
             raise AssertionError("timed out")
         context.iteration(False)
         time.sleep(0.01)
+
+
+def run_main_loop(seconds):
+    """Like time.sleep, but timers and other main-loop callbacks keep running meanwhile."""
+    deadline = time.monotonic() + seconds
+    wait_for(lambda: time.monotonic() > deadline, timeout=seconds + 10)
 
 
 class DaemonTest(unittest.TestCase):
@@ -83,12 +134,15 @@ class DaemonTest(unittest.TestCase):
         self.addCleanup(patcher.stop)
         self.write_config()
         self.bus = FakeBus()
-        self.daemon = Daemon(self.tmp / "config.json", bus=self.bus, state_dir=self.tmp / "state")
+        self.session = FakeSessionBus()
+        self.daemon = Daemon(self.tmp / "config.json", bus=self.bus, state_dir=self.tmp / "state",
+                             connect_session=lambda: self.session)
 
-    def write_config(self, **device_options):
+    def write_config(self, display_off_delay=0, **device_options):
         device = {"name": "TV", "ip": "127.0.0.1", "client_key": "valid-key", "use_tls": False,
                   **device_options}
-        (self.tmp / "config.json").write_text(json.dumps({"devices": [device]}))
+        (self.tmp / "config.json").write_text(
+            json.dumps({"display_off_delay": display_off_delay, "devices": [device]}))
 
     def start(self):
         self.daemon.start()
@@ -105,7 +159,8 @@ class DaemonTest(unittest.TestCase):
         self.start()
         wait_for(lambda: self.tv.state == "Active")
         self.tv.state = "Active Standby"
-        Daemon(self.tmp / "config.json", bus=FakeBus(), state_dir=self.tmp / "state").start()
+        Daemon(self.tmp / "config.json", bus=FakeBus(), state_dir=self.tmp / "state",
+               connect_session=FakeSessionBus).start()
         time.sleep(0.5)
         self.assertEqual(self.tv.state, "Active Standby")
 
@@ -151,6 +206,61 @@ class DaemonTest(unittest.TestCase):
         self.bus.emit("PrepareForSleep", "(b)", (True,))
         wait_for(lambda: not self.bus.lock_held("sleep"))
         self.assertEqual(self.tv.state, "Active")
+
+    def test_display_off_turns_tv_off_and_display_on_turns_it_back_on(self):
+        self.start()
+        self.session.set_mode(3)
+        wait_for(lambda: self.tv.state == "Active Standby")
+        self.session.set_mode(0)
+        wait_for(lambda: self.tv.state == "Active")
+
+    def test_display_off_respects_input_check(self):
+        self.write_config(hdmi_input=1, check_input_before_power_off=True)
+        self.tv.app = "com.webos.app.hdmi2"
+        self.start()
+        self.session.set_mode(3)
+        wait_for(lambda: URI_FOREGROUND_APP in self.tv.uris() and not self.daemon._busy.locked())
+        self.assertNotIn("system/turnOff", self.tv.uris())
+        self.assertEqual(self.tv.state, "Active")
+
+    def test_display_off_waits_for_the_delay(self):
+        self.write_config(display_off_delay=1)
+        self.start()
+        self.session.set_mode(3)
+        run_main_loop(0.5)
+        self.assertEqual(self.tv.state, "Active")
+        wait_for(lambda: self.tv.state == "Active Standby", timeout=2)
+
+    def test_display_back_on_within_the_delay_leaves_tv_alone(self):
+        self.write_config(display_off_delay=1)
+        self.start()
+        requests_before = len(self.tv.requests)
+        self.session.set_mode(3)
+        self.session.set_mode(0)
+        run_main_loop(1.5)
+        self.assertEqual(len(self.tv.requests), requests_before)
+        self.assertEqual(self.tv.state, "Active")
+
+    def test_suspend_cancels_a_pending_display_off(self):
+        # Otherwise the timer would fire just after resume and turn the TV straight back off.
+        self.write_config(display_off_delay=1)
+        self.start()
+        self.session.set_mode(3)
+        self.bus.emit("PrepareForSleep", "(b)", (True,))
+        wait_for(lambda: not self.bus.lock_held("sleep"))
+        self.bus.emit("PrepareForSleep", "(b)", (False,))
+        wait_for(lambda: self.tv.state == "Active")
+        run_main_loop(1.5)
+        self.assertEqual(self.tv.state, "Active")
+
+    def test_display_waking_during_suspend_does_not_turn_tv_back_on(self):
+        self.start()
+        self.bus.emit("PrepareForSleep", "(b)", (True,))
+        self.session.set_mode(3)
+        self.session.set_mode(0)  # e.g. the lock screen coming up as the system goes to sleep
+        wait_for(lambda: not self.bus.lock_held("sleep"))
+        time.sleep(0.5)
+        self.assertEqual(self.tv.state, "Active Standby")
 
     def test_unannounced_poweroff_is_caught_on_stop(self):
         self.start()

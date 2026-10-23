@@ -34,6 +34,8 @@ class Config:
     devices: list[Device] = field(default_factory=list)
     # How long to keep trying to wake a TV, in seconds.
     power_on_timeout: int = 40
+    # How long the desktop's display must stay off before the TVs are turned off, in seconds.
+    display_off_delay: int = 10
     path: Path = field(default_factory=default_path, compare=False)
 
     @classmethod
@@ -51,11 +53,13 @@ class Config:
                        for d in data.get("devices", [])]
         except TypeError as e:
             raise ValueError(f"{path}: invalid device entry: {e}") from None
-        return cls(devices=devices, power_on_timeout=int(data.get("power_on_timeout", 40)), path=path)
+        return cls(devices=devices, power_on_timeout=int(data.get("power_on_timeout", 40)),
+                   display_off_delay=int(data.get("display_off_delay", 10)), path=path)
 
     def save(self) -> None:
         data = {
             "power_on_timeout": self.power_on_timeout,
+            "display_off_delay": self.display_off_delay,
             "devices": [dataclasses.asdict(d) for d in self.devices],
         }
         self.path.parent.mkdir(parents=True, exist_ok=True)

@@ -12,12 +12,14 @@ This first version covers the core feature set:
 | resumes                  | is powered on                                          |
 | shuts down               | is powered off                                         |
 | reboots                  | is left alone                                          |
+| turns the display off    | is powered off 10 s later (GNOME: *Screen Blank*, or locking the screen) |
+| turns the display on     | is powered on                                          |
 
 Plus a command line for manual control (`on`, `off`, `screen-off`, `input 2`, ...), multiple
 TVs, and the optional "only turn the TV off if it is showing the PC's HDMI input" and "switch
 to the PC's input on power-on" settings.
 
-Not ported yet: blanking the screen when the user is idle or the desktop turns the display off,
+Not ported yet: blanking the screen when the user is idle (upstream's "user idle mode"),
 remote-streaming detection, multi-monitor topology, and the GUI.
 
 ## Requirements
@@ -26,6 +28,8 @@ remote-streaming detection, multi-monitor topology, and the GUI.
   the TV is also turned off for a reboot and turned back on when the PC comes up.
 - Python 3.10+ and PyGObject (`python3-gi`), which Ubuntu desktop includes. No pip packages.
 - The TV must be on the same subnet as the PC, because Wake-on-LAN is a broadcast.
+- Following the display on and off needs GNOME. On other desktops everything else still
+  works.
 
 ## TV setup
 
@@ -81,6 +85,7 @@ Logs from the service: `journalctl -u lgtv-companion@$USER -f`
 ```json
 {
   "power_on_timeout": 40,
+  "display_off_delay": 10,
   "devices": [
     {
       "name": "OLED55C1PUB",
@@ -100,12 +105,13 @@ Logs from the service: `journalctl -u lgtv-companion@$USER -f`
 | Setting | Meaning |
 |---|---|
 | `power_on_timeout` | How many seconds to keep sending Wake-on-LAN and polling while turning a TV on. |
+| `display_off_delay` | How many seconds the display must stay off before the TVs are turned off. GNOME switches the display off as soon as you lock the screen, so this gives you time to come back without waiting for the TV to wake up. `0` turns them off at once. |
 | `macs` | MAC address(es) for Wake-on-LAN. `pair` fills this in. Add the other one if the TV switches between Wi-Fi and Ethernet. |
 | `use_tls` | Use the encrypted port 3001. Firmware from 2022 onwards requires it; `pair` falls back to port 3000 for older TVs. |
 | `enabled` | `false` excludes the TV from automatic power control and from commands run without `-d`. |
 | `hdmi_input` | The HDMI input (1–4) that the PC is connected to. The two options below use it. |
 | `set_input_on_power_on` | Switch to `hdmi_input` after turning the TV on. |
-| `check_input_before_power_off` | On sleep/shutdown, turn the TV off only if it is showing `hdmi_input`. This avoids switching it off while someone is watching something else. Manual `off` ignores this. |
+| `check_input_before_power_off` | On sleep/shutdown/display off, turn the TV off only if it is showing `hdmi_input`. This avoids switching it off while someone is watching something else. Manual `off` ignores this. |
 
 The file has mode 0600, because anyone who has a client key can control the TV.
 
@@ -117,6 +123,12 @@ The file has mode 0600, because anyone who has a client key can control the TV.
   `InhibitDelayMaxSec`). Run `systemd-inhibit --list` to see them.
 - If something shuts the system down without going through logind, the daemon notices when
   systemd stops it and turns the TV off then. A reboot is still skipped in that case.
+- **Display power** comes from GNOME's Mutter, which publishes it as the `PowerSaveMode`
+  property on the session bus. The daemon runs as your user, so it connects to your session
+  bus (`/run/user/<uid>/bus`) whenever you are logged in. If the display comes back on within
+  `display_off_delay`, the TVs are left alone. Changes during a suspend or shutdown are
+  ignored, so the lock screen waking up can't turn the TV back on. The login screen's
+  blanking isn't followed, because that runs as a different user.
 - **Talking to the TV** uses the webOS "second screen" WebSocket API (SSAP). This repo contains
   a small WebSocket client, so no third-party libraries are needed. The registration manifest
   and request URIs are the ones upstream LGTV Companion uses.

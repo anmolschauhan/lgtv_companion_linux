@@ -3,6 +3,7 @@
     boot, resume             -> power the TVs on
     suspend, shutdown        -> power the TVs off
     reboot                   -> leave the TVs alone
+    display off / on         -> power the TVs off / on (GNOME's screen blanking)
 
 logind "delay" inhibitor locks hold suspend and shutdown back (for at most
 InhibitDelayMaxSec) until the TVs have been told to turn off.
@@ -17,6 +18,7 @@ from pathlib import Path
 from gi.repository import Gio, GLib
 
 from .config import Config
+from .display import DisplayWatcher, connect_session_bus
 from .tv import TV, run_on_all
 
 log = logging.getLogger(__name__)
@@ -34,9 +36,10 @@ REBOOT_TARGETS = {"reboot.target", "kexec.target", "soft-reboot.target"}
 
 class Daemon:
     def __init__(self, config_path: Path, bus: Gio.DBusConnection | None = None,
-                 state_dir: Path | None = None):
+                 state_dir: Path | None = None, connect_session=connect_session_bus):
         self.config_path = config_path
         self.bus = bus or Gio.bus_get_sync(Gio.BusType.SYSTEM)
+        self.display = DisplayWatcher(self._on_display_change, connect_session)
         self.state_dir = state_dir or Path(
             os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state") / "lgtv-companion"
         self.loop = GLib.MainLoop()
@@ -45,6 +48,7 @@ class Daemon:
         self.shutdown_announced = False
         self._busy = threading.Lock()
         self._cancel = threading.Event()
+        self._display_off_timer = 0  # GLib source that turns the TVs off after display_off_delay
 
     def run(self) -> None:
         self.start()
@@ -70,12 +74,47 @@ class Daemon:
             log.warning("No paired TVs yet; run `lgtv-companion pair` (no restart needed)")
         if self._first_start_this_boot():
             self._dispatch("boot", self._power_on_all)
+        self.display.start()
 
     # --- event handling -------------------------------------------------------------------
+
+    def _on_display_change(self, on: bool) -> None:
+        off_was_pending = self._cancel_display_off()
+        if self.preparing:
+            # Suspend or shutdown is under way and deals with the TVs itself; the screen
+            # waking for the lock screen must not turn them back on.
+            log.debug("Display turned %s during %s; ignoring", "on" if on else "off",
+                      " and ".join(sorted(self.preparing)))
+        elif on and off_was_pending:
+            log.info("Display back on; the TVs were never turned off")
+        elif on:
+            self._dispatch("display on", self._power_on_all)
+        else:
+            # GNOME turns the display off as soon as the screen is locked; give the user a
+            # moment to come back before the TVs go off and take a while to wake up again.
+            delay = max(0, self._config().display_off_delay)
+            log.info("Display off; turning the TVs off in %ss unless it comes back on", delay)
+            self._display_off_timer = GLib.timeout_add(delay * 1000, self._on_display_off_timeout)
+
+    def _on_display_off_timeout(self) -> bool:
+        self._display_off_timer = 0
+        self._dispatch("display off", self._power_off_all)
+        return GLib.SOURCE_REMOVE
+
+    def _cancel_display_off(self) -> bool:
+        if not self._display_off_timer:
+            return False
+        GLib.source_remove(self._display_off_timer)
+        self._display_off_timer = 0
+        return True
 
     def _on_logind_signal(self, _conn, _sender, _path, _iface, signal_name, params) -> None:
         args = params.unpack()
         starting = args[0]
+        if starting:
+            # Sleep or shutdown turns the TVs off itself. A timer left running across a suspend
+            # would fire just after resume and turn them off again.
+            self._cancel_display_off()
         if signal_name == "PrepareForSleep":
             if starting:
                 self.preparing.add("sleep")
