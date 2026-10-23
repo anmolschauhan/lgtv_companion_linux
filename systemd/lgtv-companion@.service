@@ -1,0 +1,24 @@
+# LGTV Companion daemon, run as the user given after the "@" so it reads that user's
+# ~/.config/lgtv-companion/config.json. It is a system service (not a user service) so it
+# can turn the TV on at boot, before anyone logs in.
+#
+#   sudo systemctl enable --now lgtv-companion@$USER.service
+
+[Unit]
+Description=LGTV Companion (power LG TVs on/off with this PC) for %i
+Wants=network-online.target
+# Ordering after the network also means we are stopped before it at shutdown.
+After=network-online.target dbus.service systemd-logind.service
+
+[Service]
+User=%i
+ExecStart=/usr/local/bin/lgtv-companion daemon
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target
